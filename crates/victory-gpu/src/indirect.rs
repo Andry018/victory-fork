@@ -991,7 +991,8 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                let (x, y) = crate::host::card_compare_groups(PIECES);
+                warp.list.Dispatch(x, y, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -1019,6 +1020,20 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        // Each thread of a piece's group hashes its own steps: a change in
+        // the first and in the last 16 bytes of a piece is found, and only
+        // in that piece.
+        for at in [0, PIECE - 1, 2 * PIECE + 16, 3 * PIECE - 1] {
+            // SAFETY: inside the mapping.
+            let flip = |value: u8| unsafe { now_ptr.add(at).write_volatile(value) };
+            let mut want = [0u32; 3];
+            want[at / PIECE] = 1;
+            flip(content[at] ^ 1);
+            assert_eq!(run(&mut warp, 2), want, "a change at byte {at}");
+            flip(content[at]);
+            assert_eq!(run(&mut warp, 2), want, "changed back at byte {at}");
+            assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+        }
     }
 
     /// The fetch inside flights (`crate::host::CARD_FETCH`), on the software

@@ -1541,11 +1541,20 @@ unsafe impl Send for CardWork {}
 static CARD_WORK: Mutex<Option<CardWork>> = Mutex::new(None);
 
 /// The compare of a declared range of a copy in the card's memory with
-/// its bytes from before, one thread per 64 KiB piece (cut at multiples of
-/// 64 KiB of title memory, as `Shadow::card_piece` cuts them): `differs`
-/// gets a dword per piece, 1 where a byte differs. The offsets are widened
-/// to 16 bytes; buffers are multiples of 64 KiB, and a piece flagged for a
-/// byte just outside the range costs a fetch that finds nothing.
+/// its bytes from before, one group of 64 threads per 64 KiB piece (cut at
+/// multiples of 64 KiB of title memory, as `Shadow::card_piece` cuts
+/// them): `differs` gets a dword per piece, 1 where a byte differs. The
+/// offsets are widened to 16 bytes; buffers are multiples of 64 KiB, and a
+/// piece flagged for a byte just outside the range costs a fetch that finds
+/// nothing.
+///
+/// Each thread hashes every 64th 16-byte step of its piece (64 steps for a
+/// whole piece), and the first thread folds the 64 hashes in order. One
+/// thread walked the whole piece before, 4,096 steps one after the other,
+/// so every pass took the time of a piece walked alone however few pieces
+/// it had; there are some 130 such passes a frame (on an RX 6600: 122 hash
+/// passes after ranges are sent up and 8 compares). The hash is only ever
+/// compared with hashes this shader made. Groups: [`card_compare_groups`].
 pub(crate) const CARD_COMPARE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
 cbuffer Span : register(b0) {
@@ -1561,29 +1570,47 @@ ByteAddressBuffer now : register(t0);
 // last sent up (or hashed whole, the first time).
 RWByteAddressBuffer hashes : register(u0);
 RWByteAddressBuffer differs : register(u1);
+groupshared uint4 part[64];
+static const uint4 MUL = uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+uint4 mix(uint4 h, uint4 x) {
+    h = (h ^ x) * MUL;
+    return h.yzwx ^ (h >> 15);
+}
+// One group per piece of the run: groups (x, y), piece x + 65535 y.
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-    if (id.x >= pieces) return;
-    uint piece = first + id.x;
+void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
+    uint i = group.x + group.y * 65535u;
+    bool live = i < pieces;
+    uint piece = first + i;
     uint lo = piece * 65536u;
     lo = lo > skew ? lo - skew : 0u;
     uint hi = min((piece + 1u) * 65536u - skew, size);
     lo = lo & ~15u;
     hi = (hi + 15u) & ~15u;
-    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    // Thread t: the steps at lo + 16 t, then every 1,024 bytes.
+    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu) ^ t;
+    if (live) {
+        [loop]
+        for (uint at = lo + 16u * t; at < hi; at += 1024u) {
+            h = mix(h, now.Load4(at));
+        }
+    }
+    part[t] = h;
+    GroupMemoryBarrierWithGroupSync();
+    if (!live || t != 0u) return;
+    uint4 f = uint4(0x27D4EB2Fu, 0xC2B2AE35u, 0x85EBCA6Bu, 0x9E3779B9u);
     [loop]
-    for (uint at = lo; at < hi; at += 16u) {
-        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
-        h = h.yzwx ^ (h >> 15);
+    for (uint k = 0u; k < 64u; k++) {
+        f = mix(f, part[k]);
     }
     if (compare != 0u) {
-        differs.Store(out_at + id.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+        differs.Store(out_at + i * 4u, any(f != hashes.Load4(piece * 16u)) ? 1u : 0u);
         // With the copy-back on its own thread: the next compare of the
         // piece finds what is written from here on.
-        if (compare == 2u) hashes.Store4(piece * 16u, h);
+        if (compare == 2u) hashes.Store4(piece * 16u, f);
     } else {
-        hashes.Store4(piece * 16u, h);
+        hashes.Store4(piece * 16u, f);
     }
 }
 "#;
@@ -1728,6 +1755,12 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
     }
 }
 "#;
+
+/// The groups (x, y) of a [`CARD_COMPARE`] pass over `pieces` pieces: one
+/// group per piece, no more than 65,535 a dimension.
+pub(crate) fn card_compare_groups(pieces: u32) -> (u32, u32) {
+    (pieces.clamp(1, 65_535), pieces.div_ceil(65_535).max(1))
+}
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
@@ -4120,7 +4153,8 @@ impl Host {
                         for run in runs {
                             let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(run.pieces.div_ceil(64), 1, 1);
+                            let (x, y) = card_compare_groups(run.pieces);
+                            list.Dispatch(x, y, 1);
                         }
                     }
                     list.Close()?;
@@ -4209,7 +4243,8 @@ impl Host {
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.Dispatch(r.span.pieces.div_ceil(64), 1, 1);
+                        let (x, y) = card_compare_groups(r.span.pieces);
+                        list.Dispatch(x, y, 1);
                         CARD_PASSES[2].fetch_add(1, Ordering::Relaxed);
                     }
                     // The fetch inside the flight (`inflight_fetch`): behind
