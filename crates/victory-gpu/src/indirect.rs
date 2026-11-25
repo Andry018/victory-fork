@@ -991,8 +991,10 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                let (x, y) = crate::host::card_compare_groups(PIECES);
-                warp.list.Dispatch(x, y, 1);
+                // One group per piece (`card_compare_groups` without
+                // `VICTORY_CARD_COMPARE_SERIAL`, which this test does not
+                // follow: it compiles `CARD_COMPARE` itself).
+                warp.list.Dispatch(PIECES, 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.

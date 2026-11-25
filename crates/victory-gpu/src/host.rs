@@ -1759,8 +1759,62 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 /// The groups (x, y) of a [`CARD_COMPARE`] pass over `pieces` pieces: one
 /// group per piece, no more than 65,535 a dimension.
 pub(crate) fn card_compare_groups(pieces: u32) -> (u32, u32) {
+    if card_compare_serial() {
+        return (pieces.div_ceil(64), 1);
+    }
     (pieces.clamp(1, 65_535), pieces.div_ceil(65_535).max(1))
 }
+
+/// `VICTORY_CARD_COMPARE_SERIAL=1`: the compare as it was, one thread per
+/// piece walking it alone ([`CARD_COMPARE_SERIAL`]); for comparing the two
+/// in one build (the shader cache is per build).
+fn card_compare_serial() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_COMPARE_SERIAL").is_some_and(|v| v == "1"))
+}
+
+/// [`CARD_COMPARE`] as it was: one thread per piece.
+const CARD_COMPARE_SERIAL: &str = r#"
+#define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), UAV(u0), UAV(u1)"
+cbuffer Span : register(b0) {
+    uint first;    // the first piece
+    uint skew;     // where the copy starts in its piece 0
+    uint size;     // the copy's buffer, in bytes (a multiple of 64 KiB)
+    uint pieces;
+    uint out_at;   // the first piece's dword in `differs`, in bytes
+    uint compare;  // 0: the hashes are stored; else compared with those stored (2: and then stored)
+};
+ByteAddressBuffer now : register(t0);
+// 16 bytes per piece of the copy: the hash of its bytes when they were
+// last sent up (or hashed whole, the first time).
+RWByteAddressBuffer hashes : register(u0);
+RWByteAddressBuffer differs : register(u1);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= pieces) return;
+    uint piece = first + id.x;
+    uint lo = piece * 65536u;
+    lo = lo > skew ? lo - skew : 0u;
+    uint hi = min((piece + 1u) * 65536u - skew, size);
+    lo = lo & ~15u;
+    hi = (hi + 15u) & ~15u;
+    uint4 h = uint4(0x9E3779B9u, 0x85EBCA6Bu, 0xC2B2AE35u, 0x27D4EB2Fu);
+    [loop]
+    for (uint at = lo; at < hi; at += 16u) {
+        h = (h ^ now.Load4(at)) * uint4(0x01000193u, 0x9E3779B1u, 0x85EBCA77u, 0xC2B2AE3Du);
+        h = h.yzwx ^ (h >> 15);
+    }
+    if (compare != 0u) {
+        differs.Store(out_at + id.x * 4u, any(h != hashes.Load4(piece * 16u)) ? 1u : 0u);
+        // With the copy-back on its own thread: the next compare of the
+        // piece finds what is written from here on.
+        if (compare == 2u) hashes.Store4(piece * 16u, h);
+    } else {
+        hashes.Store4(piece * 16u, h);
+    }
+}
+"#;
 
 /// Whether the pieces hashed again after ranges were sent up to a copy in
 /// the card's memory are hashed in runs of pieces that touch, each piece
@@ -3833,10 +3887,11 @@ impl Host {
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: the source and names live through the call; the out
         // pointer is ours.
+        let source = if card_compare_serial() { CARD_COMPARE_SERIAL } else { CARD_COMPARE };
         unsafe {
             D3DCompile(
-                CARD_COMPARE.as_ptr().cast(),
-                CARD_COMPARE.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 windows::core::s!("card compare"),
                 None,
                 None,
